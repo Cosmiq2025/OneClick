@@ -1,0 +1,31 @@
+{
+  "name": "oneclick",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@openzeppelin/contracts": "^5.4.0",
+    "@types/node": "^24.6.2",
+    "@types/react": "19.1.13",
+    "dotenv": "^17.2.2",
+    "ethers": "^6.15.0",
+    "hardhat": "^2.26.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "next": "15.5.4",
+    "posthog-js": "^1.268.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "x402-express": "^0.6.5",
+    "x402-fetch": "^0.6.6"
+  }
+}

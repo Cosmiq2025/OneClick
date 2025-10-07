@@ -1,0 +1,19 @@
+{
+  "posts": [
+    [
+      "post-1759824691239-m5ag",
+      {
+        "title": "Demo post",
+        "priceUsd": 1,
+        "recipient": "0xfcc9fc550ee0ff3f1d048232d963c2995119bbda",
+        "creator": "0xfcc9fc550ee0ff3f1d048232d963c2995119bbda",
+        "preview": "Demo secret…",
+        "content": "This is a demo secret body",
+        "sourceType": "manual",
+        "createdAt": "2025-10-07T08:11:31.239Z"
+      }
+    ]
+  ],
+  "splits": [],
+  "savedAt": "2025-10-07T08:16:20.324Z"
+}
