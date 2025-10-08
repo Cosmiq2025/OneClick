@@ -27,21 +27,25 @@ function requirePaid(req, res, next) {
     x402Version: 1,
     error: "X-PAYMENT header is required",
     accepts: [{
-      scheme: "exact",
-      network: X402_NETWORK,               // "base-sepolia"
+      scheme: "exact",                  // keep scheme; we’ll allow a safe band
+      network: X402_NETWORK,
       resource: fullUrl,
       description: "Unlock premium post",
       mimeType: "text/html",
 
-      // Required for wallet popup:
-      payTo: RECEIVER_ADDRESS,             // your payee wallet (env)
-      asset: USDC_BASE_SEPOLIA,            // USDC test token
-      maxAmountRequired: "1500000",        // $1.00 in 6-decimals USDC
+      payTo: RECEIVER_ADDRESS,
+      asset: USDC_BASE_SEPOLIA,
+
+      // ---- allow between 1.00 and 2.00 USDC (6 decimals) ----
+      minAmountRequired: "1000000",     // 1.00 USDC
+      maxAmountRequired: "2000000",     // 2.00 USDC headroom
+
       maxTimeoutSeconds: 60,
       extra: { name: "USDC", version: "2" },
     }],
   });
 }
+
 
 // Paywall BEFORE routes (keep it)
 app.use(paymentMiddleware(
