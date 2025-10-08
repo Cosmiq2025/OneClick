@@ -36,7 +36,7 @@ function requirePaid(req, res, next) {
       // Required for wallet popup:
       payTo: RECEIVER_ADDRESS,             // your payee wallet (env)
       asset: USDC_BASE_SEPOLIA,            // USDC test token
-      maxAmountRequired: "1000000",        // $1.00 in 6-decimals USDC
+      maxAmountRequired: "1500000",        // $1.00 in 6-decimals USDC
       maxTimeoutSeconds: 60,
       extra: { name: "USDC", version: "2" },
     }],
