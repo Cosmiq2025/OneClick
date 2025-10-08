@@ -3,30 +3,28 @@ import cors from "cors";
 import { paymentMiddleware } from "x402-express";
 
 const app = express();
-app.use(cors());                // allow GET from anywhere (fine for share links)
+app.use(cors());
 app.use(express.json());
 
-// ---- env ----
 const RECEIVER_ADDRESS = process.env.RECEIVER_ADDRESS || "";
 const FACILITATOR_URL  = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
 const X402_NETWORK     = process.env.X402_NETWORK || "base-sepolia";
 if (!RECEIVER_ADDRESS) throw new Error("RECEIVER_ADDRESS is not set");
 
-// ---- PAYWALL: must come BEFORE your route handler ----
+// ---- PAYWALL FIRST (blocks GET /api/unlock until paid) ----
 app.use(paymentMiddleware(
   RECEIVER_ADDRESS,
   {
     "GET /api/unlock": {
       price: "$1.00",
       network: X402_NETWORK,
-      // return HTML so the browser shows the post after payment
       config: { description: "Unlock premium post", mimeType: "text/html" },
     },
   },
   { url: FACILITATOR_URL }
 ));
 
-// ---- CONTENT after successful payment ----
+// ---- CONTENT AFTER PAYMENT ----
 app.get("/api/unlock", (req, res) => {
   const q = req.query ?? {};
   const title = String(q.title ?? "Unlocked Post").slice(0, 200);
@@ -50,11 +48,11 @@ app.get("/api/unlock", (req, res) => {
 </div>`);
 });
 
-// optional: redirect root -> sample link
-app.get("/", (_req, res) => {
-  res.redirect("/api/unlock?title=Demo&body=Pay%20%E2%86%92%20unlock%20%E2%86%92%20post");
-});
+// optional: redirect root → sample link
+app.get("/", (_req, res) =>
+  res.redirect("/api/unlock?title=Demo&body=Pay%20%E2%86%92%20unlock%20%E2%86%92%20post")
+);
 
-// ---- listen (Render uses PORT) ----
+// Render/Heroku-style port
 const PORT = Number(process.env.PORT || process.env.X402_PORT || 4021);
 app.listen(PORT, () => console.log(`listening on :${PORT}`));
