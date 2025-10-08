@@ -1,4 +1,4 @@
-// ...top of file (unchanged)
+// apps/miniapp/server.mjs
 import express from "express";
 import cors from "cors";
 import { paymentMiddleware } from "x402-express";
@@ -14,25 +14,36 @@ const FACILITATOR_URL  = process.env.FACILITATOR_URL || "https://x402.org/facili
 const X402_NETWORK     = process.env.X402_NETWORK || "base-sepolia";
 if (!RECEIVER_ADDRESS) throw new Error("RECEIVER_ADDRESS is not set");
 
-// --- HARD GUARD: return 402 unless X-PAYMENT is present ---
+// USDC (Base Sepolia) — can override via env if needed
+const USDC_BASE_SEPOLIA =
+  process.env.USDC_BASE_SEPOLIA || "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+
+// --- HARD GUARD: return 402 with a FULL challenge unless X-PAYMENT is present ---
 function requirePaid(req, res, next) {
-  if (!req.headers["x-payment"]) {
-    return res.status(402).json({
-      x402Version: 1,
-      error: "X-PAYMENT header is required",
-      accepts: [{
-        scheme: "exact",
-        network: X402_NETWORK,
-        resource: `${req.protocol}://${req.get("host")}/api/unlock`,
-        description: "Unlock premium post",
-        mimeType: "text/html",
-      }],
-    });
-  }
-  next();
+  if (req.headers["x-payment"]) return next();
+
+  const fullUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+  return res.status(402).json({
+    x402Version: 1,
+    error: "X-PAYMENT header is required",
+    accepts: [{
+      scheme: "exact",
+      network: X402_NETWORK,               // "base-sepolia"
+      resource: fullUrl,
+      description: "Unlock premium post",
+      mimeType: "text/html",
+
+      // Required for wallet popup:
+      payTo: RECEIVER_ADDRESS,             // your payee wallet (env)
+      asset: USDC_BASE_SEPOLIA,            // USDC test token
+      maxAmountRequired: "1000000",        // $1.00 in 6-decimals USDC
+      maxTimeoutSeconds: 60,
+      extra: { name: "USDC", version: "2" },
+    }],
+  });
 }
 
-// Paywall BEFORE routes (still keep it)
+// Paywall BEFORE routes (keep it)
 app.use(paymentMiddleware(
   RECEIVER_ADDRESS,
   {
@@ -48,13 +59,17 @@ app.use(paymentMiddleware(
 // Content AFTER payment (guarded)
 app.get("/api/unlock", requirePaid, (req, res) => {
   const q = req.query ?? {};
-  const esc = s => String(s || "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const esc = (s) =>
+    String(s || "").replace(/[&<>"']/g, (m) =>
+      ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])
+    );
+
   const title = esc((q.title ?? "Unlocked Post").toString().slice(0,200));
   const by    = esc((q.by    ?? "").toString().slice(0,120));
   const img   = (q.img ? esc(q.img.toString()).slice(0,2048) : "");
   const body  = esc((q.body  ?? "🎉 Payment confirmed.").toString().slice(0,8000)).replace(/\n/g,"<br>");
 
-  res.type("html").send(`<!doctype html><meta charset="utf-8"><title>${title}</title>
+  res.set("Cache-Control","no-store").type("html").send(`<!doctype html><meta charset="utf-8"><title>${title}</title>
   <style>body{font:16px/1.6 system-ui;margin:32px;background:#fafafa}
   .card{max-width:760px;margin:0 auto;padding:24px;border:1px solid #eee;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.04);background:#fff}
   h1{font-size:28px;margin:0 0 6px;color:#222}img{max-width:100%;height:auto;border-radius:12px;margin:12px 0}
