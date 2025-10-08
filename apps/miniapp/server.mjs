@@ -21,19 +21,18 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const toUnits6 = (usd) => Math.round(usd * 1_000_000);
 
 // ----- HARD GUARD: 402 until X-PAYMENT present -----
-// Supports optional ?price=0.01..100 (USD). If absent, defaults to $1.00.
+// Optional ?price=0.01..100 (USD). Defaults to $1.00 if absent/invalid.
 function requirePaid(req, res, next) {
   if (req.headers["x-payment"]) return next();
 
-  // price in USD (decimal), default $1.00
   const raw = req.query?.price;
   let price = Number.parseFloat(Array.isArray(raw) ? raw[0] : raw);
   if (!Number.isFinite(price)) price = 1.00;
-  price = clamp(price, 0.01, 100);
+  price = clamp(price, 0.01, 100.0);
 
-  const units = toUnits6(price);                // USDC-6
-  const minAmountRequired = String(units);      // exact price
-  const maxAmountRequired = String(Math.ceil(units * 1.20)); // +20% headroom (NO extra ')')
+  const units = toUnits6(price);                   // USDC-6
+  const minAmountRequired = String(units);         // exact price
+  const maxAmountRequired = String(Math.ceil(units * 1.20)); // +20% headroom
 
   const fullUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
   return res.status(402).json({
@@ -55,7 +54,7 @@ function requirePaid(req, res, next) {
   });
 }
 
-// Keep the library paywall (it’s fine to have both)
+// Keep library paywall too (harmless to have both)
 app.use(paymentMiddleware(
   RECEIVER_ADDRESS,
   {
