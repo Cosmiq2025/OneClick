@@ -35,14 +35,21 @@ const esc = (s) =>
     ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])
   );
 
-// --- HARD GUARD: return 402 with FULL challenge unless X-PAYMENT present ---
+// --- HARD GUARD: return 402 with dynamic challenge unless X-PAYMENT is present ---
 function requirePaid(req, res, next) {
   if (req.headers["x-payment"]) return next();
+  const q = req.query ?? {};
+  // price in USD, default $1.00; clamp to sane range 0.01..100
+  let priceUsd = Number(q.price ?? "1");
+  if (!Number.isFinite(priceUsd)) priceUsd = 1;
+  priceUsd = Math.min(100, Math.max(0.01, priceUsd));
 
-  // Read ?price= (USD), default $1.00; guard range; convert to USDC(6)
-  const raw = Array.isArray(req.query.price) ? req.query.price[0] : req.query.price;
-  const priceUSD = clamp(Number(raw ?? 1), 0.01, 10000);
-  const amount   = Math.round(priceUSD * 1e6); // USDC has 6 decimals
+  // USDC has 6 decimals on Base Sepolia
+  const units = Math.round(priceUsd * 1e6);
+
+  // allow a small range (±20%) so wallets/facilitators have room
+  const minAmountRequired = String(Math.max(1, Math.floor(units * 0.98)));
+  const maxAmountRequired = String(Math.ceil(units * 1.20)));
 
   const fullUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
   return res.status(402).json({
@@ -52,12 +59,12 @@ function requirePaid(req, res, next) {
       scheme: "exact",
       network: X402_NETWORK,
       resource: fullUrl,
-      description: `Unlock premium post ($${priceUSD.toFixed(2)})`,
+      description: `Unlock premium post ($${priceUsd.toFixed(2)})`,
       mimeType: "text/html",
       payTo: RECEIVER_ADDRESS,
       asset: USDC_BASE_SEPOLIA,
-      minAmountRequired: String(amount),                    // exact price in micro USDC
-      maxAmountRequired: String(Math.round(amount * 1.2)),  // +20% headroom for rounding
+      minAmountRequired,
+      maxAmountRequired,
       maxTimeoutSeconds: 60,
       extra: { name: "USDC", version: "2" },
     }],
