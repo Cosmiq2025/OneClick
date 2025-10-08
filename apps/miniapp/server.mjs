@@ -4,40 +4,16 @@ import { paymentMiddleware } from "x402-express";
 
 const app = express();
 app.set("trust proxy", 1);
-
-// ---- CORS ----
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://one-click-warp.lovable.app";
-const corsOptions = {
-  origin: CORS_ORIGIN,
-  methods: ["GET", "HEAD", "OPTIONS"],
-  allowedHeaders: ["content-type", "accept", "x-payment"],
-  credentials: false,
-  maxAge: 86400,
-};
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.use(cors());
 app.use(express.json());
 
-// ---- ENV ----
+// === ENV ===
 const RECEIVER_ADDRESS = process.env.RECEIVER_ADDRESS || "";
 const FACILITATOR_URL  = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
 const X402_NETWORK     = process.env.X402_NETWORK || "base-sepolia";
 if (!RECEIVER_ADDRESS) throw new Error("RECEIVER_ADDRESS is not set");
 
-// ---- XSS helpers ----
-const escapeHtml = (str) => {
-  const map = { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" };
-  return String(str).replace(/[&<>"']/g, (m) => map[m]);
-};
-const sanitizeInput = (v, max, d="") => (typeof v === "string" ? escapeHtml(v.trim().slice(0, max)) : d);
-const isValidUrl = (s) => { try { const u=new URL(String(s)); return u.protocol==="http:"||u.protocol==="https:"; } catch { return false; } };
-
-// ---- logging ----
-const log = (level, message, meta = {}) => {
-  console.log(JSON.stringify({ timestamp: new Date().toISOString(), level, message, ...meta }));
-};
-
-// ---- PAYWALL FIRST ----
+// === ПЕЙВОЛЛ ДОЛЖЕН ИДТИ ПЕРЕД РОУТАМИ ===
 app.use(paymentMiddleware(
   RECEIVER_ADDRESS,
   {
@@ -50,121 +26,25 @@ app.use(paymentMiddleware(
   { url: FACILITATOR_URL }
 ));
 
-// ---- CONTENT AFTER PAYMENT ----
+// === КОНТЕНТ ПОСЛЕ ОПЛАТЫ ===
 app.get("/api/unlock", (req, res) => {
-  try {
-    res.set("Cache-Control", "no-store"); // avoid caching unlocked HTML
-    const q = req.query ?? {};
-    const title  = sanitizeInput(q.title, 200, "Unlocked Post");
-    const by     = sanitizeInput(q.by,   120);
-    const imgUrl = String(q.img || "").slice(0, 2048);
-    const img    = imgUrl && isValidUrl(imgUrl) ? escapeHtml(imgUrl) : "";
-    const body   = sanitizeInput(q.body, 8000, "🎉 Payment confirmed.");
+  const q = req.query ?? {};
+  const esc = s => String(s || "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const title = esc((q.title ?? "Unlocked Post").toString().slice(0,200));
+  const by    = esc((q.by    ?? "").toString().slice(0,120));
+  const img   = (q.img ? esc(q.img.toString()) : "");
+  const body  = esc((q.body  ?? "🎉 Payment confirmed.").toString().slice(0,8000)).replace(/\n/g,"<br>");
 
-    log("info", "Content unlocked", { title, hasImage: !!img });
-
-    res.type("html").send(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title>
-<style>
-  body{font:16px/1.6 system-ui;margin:32px;background:#fafafa}
+  res.type("html").send(`<!doctype html><meta charset="utf-8"><title>${title}</title>
+  <style>body{font:16px/1.6 system-ui;margin:32px;background:#fafafa}
   .card{max-width:760px;margin:0 auto;padding:24px;border:1px solid #eee;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.04);background:#fff}
-  h1{font-size:28px;margin:0 0 6px;color:#222}
-  img{max-width:100%;height:auto;border-radius:12px;margin:12px 0}
-  .by{color:#666;font-size:13px;margin-bottom:16px}
-  .content{color:#333;line-height:1.8;word-wrap:break-word;overflow-wrap:anywhere}
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>${title}</h1>
-  ${by ? `<div class="by">by ${by}</div>` : ""}
-  ${img ? `<img src="${img}" alt="Post image" loading="lazy">` : ""}
-  <div class="content">${body.replace(/\n/g, "<br>")}</div>
-</div>
-</body>
-</html>`);
-  } catch (error) {
-    log("error", "Error serving unlocked content", { error: error.message });
-    res.status(500).json({ error: "Internal server error" });
-  }
+  h1{font-size:28px;margin:0 0 6px;color:#222}img{max-width:100%;height:auto;border-radius:12px;margin:12px 0}
+  .by{color:#666;font-size:13px;margin-bottom:16px}.content{line-height:1.8}</style>
+  <div class="card"><h1>${title}</h1>${by?`<div class="by">by ${by}</div>`:""}${img?`<img src="${img}" alt="">`:""}<div class="content">${body}</div></div>`);
 });
 
-// optional: sample landing
-app.get("/", (_req, res) =>
-  res.redirect("/api/unlock?title=Demo&body=Pay%20%E2%86%92%20unlock%20%E2%86%92%20post")
-);
-
-// simple browser tester
-app.get("/preview", (req, res) => {
-  const FAC = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
-  const NET = process.env.X402_NETWORK || "base-sepolia";
-  const preset = {
-    title: (req.query.title || "Demo").toString(),
-    by:    (req.query.by    || "").toString(),
-    img:   (req.query.img   || "").toString(),
-    body:  (req.query.body  || "Hello world").toString(),
-  };
-  res.type("html").send(`<!doctype html>
-<meta charset="utf-8"><title>Preview & Unlock</title>
-<style>
-  body{font:16px/1.6 system-ui;margin:32px;max-width:860px}
-  input,textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:10px}
-  button{padding:10px 14px;border:0;border-radius:10px;background:#111;color:#fff;cursor:pointer}
-  .row{display:grid;gap:10px;margin:10px 0}
-  iframe{width:100%;height:70vh;border:1px solid #eee;border-radius:12px;margin-top:12px}
-  .muted{color:#666;font-size:13px}
-</style>
-<h1>Preview & Unlock</h1>
-<p class="muted">Network: ${NET}</p>
-<div class="row">
-  <label>Title <input id="t" value="${preset.title.replace(/"/g,'&quot;')}"></label>
-  <label>Author (optional) <input id="by" value="${preset.by.replace(/"/g,'&quot;')}"></label>
-  <label>Cover image URL (optional) <input id="img" value="${preset.img.replace(/"/g,'&quot;')}"></label>
-  <label>Body <textarea id="b" rows="6">${preset.body.replace(/</g,"&lt;")}</textarea></label>
-</div>
-<div class="row">
-  <button id="go">Preview & Unlock</button>
-  <span id="msg" class="muted"></span>
-</div>
-<iframe id="frame" sandbox="allow-same-origin"></iframe>
-<script type="module">
-  import { wrapFetchWithPayment } from "https://esm.sh/x402-fetch@0.1.0";
-  const payFetch = wrapFetchWithPayment(fetch, {
-    facilitator: "${FAC}",
-    network: "${NET}"
-  });
-  const $=id=>document.getElementById(id);
-  const t=$("t"), by=$("by"), img=$("img"), b=$("b"), msg=$("msg"), frame=$("frame");
-  function build(){
-    const p=new URLSearchParams();
-    if(t.value) p.set("title", t.value.slice(0,200));
-    if(by.value) p.set("by", by.value.slice(0,120));
-    if(img.value) p.set("img", img.value.slice(0,2048));
-    if(b.value) p.set("body", b.value.slice(0,8000));
-    return "/api/unlock?" + p.toString();
-  }
-  $("go").onclick = async () => {
-    msg.textContent = "Requesting…";
-    try {
-      const r = await payFetch(build(), { method:"GET", headers:[["accept","text/html"]] });
-      if (!r.ok) throw new Error(await r.text().catch(()=> "HTTP "+r.status));
-      frame.srcdoc = await r.text();
-      msg.textContent = "Unlocked ✅";
-    } catch(e){ msg.textContent = "Failed: " + (e?.message || e); }
-  };
-</script>`);
-});
-
-// 404 + error handlers
-app.use((req, res) => {
-  log("warn", "Route not found", { path: req.path, method: req.method });
-  res.status(404).json({ error: "Not found" });
-});
+// удобный редирект
+app.get("/", (_req, res) => res.redirect("/api/unlock?title=Demo&body=Pay%20%E2%86%92%20unlock"));
 
 const PORT = Number(process.env.PORT || process.env.X402_PORT || 4021);
-app.listen(PORT, () => {
-  log("info", `Server started on port ${PORT}`, { network: X402_NETWORK, corsOrigin: CORS_ORIGIN });
-});
+app.listen(PORT, () => console.log(`listening on :${PORT}`));
