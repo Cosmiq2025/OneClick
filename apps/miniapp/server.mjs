@@ -3,9 +3,12 @@ import cors from "cors";
 import { paymentMiddleware } from "x402-express";
 
 const app = express();
+
+// CORS: fine for share links (HTML response opens directly)
 app.use(cors());
 app.use(express.json());
 
+// ---- ENV ----
 const RECEIVER_ADDRESS = process.env.RECEIVER_ADDRESS || "";
 const FACILITATOR_URL  = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
 const X402_NETWORK     = process.env.X402_NETWORK || "base-sepolia";
@@ -18,14 +21,33 @@ app.use(paymentMiddleware(
     "GET /api/unlock": {
       price: "$1.00",
       network: X402_NETWORK,
+      // HTML so the browser shows the post immediately after payment
       config: { description: "Unlock premium post", mimeType: "text/html" },
     },
   },
   { url: FACILITATOR_URL }
 ));
 
-// ---- CONTENT AFTER PAYMENT ----
-app.get("/api/unlock", (req, res) => {
+// ---- GUARD: require X-PAYMENT header (enforce even if middleware misses) ----
+const requirePaid = (req, res, next) => {
+  if (!req.headers["x-payment"]) {
+    return res.status(402).json({
+      x402Version: 1,
+      error: "X-PAYMENT header is required",
+      accepts: [{
+        scheme: "exact",
+        network: X402_NETWORK,
+        resource: `${req.protocol}://${req.get("host")}${req.path}`,
+        description: "Unlock premium post",
+        mimeType: "text/html",
+      }],
+    });
+  }
+  next();
+};
+
+// ---- CONTENT AFTER SUCCESSFUL PAYMENT ----
+app.get("/api/unlock", requirePaid, (req, res) => {
   const q = req.query ?? {};
   const title = String(q.title ?? "Unlocked Post").slice(0, 200);
   const by    = String(q.by ?? "").slice(0, 120);
@@ -48,11 +70,11 @@ app.get("/api/unlock", (req, res) => {
 </div>`);
 });
 
-// optional: redirect root → sample link
+// Optional: simple landing to test quickly
 app.get("/", (_req, res) =>
   res.redirect("/api/unlock?title=Demo&body=Pay%20%E2%86%92%20unlock%20%E2%86%92%20post")
 );
 
-// Render/Heroku-style port
+// ---- LISTEN (Render/Heroku-style PORT) ----
 const PORT = Number(process.env.PORT || process.env.X402_PORT || 4021);
 app.listen(PORT, () => console.log(`listening on :${PORT}`));
