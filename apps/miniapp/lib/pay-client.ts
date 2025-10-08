@@ -5,28 +5,26 @@ import { wrapFetchWithPayment } from "x402-fetch";
 
 declare global { interface Window { ethereum?: any } }
 
-export async function getPaidFetch() {
+export async function payToUnlock(url: string) {
   if (typeof window === "undefined" || !window.ethereum) {
-    throw new Error("Wallet provider not found. Install Coinbase/MetaMask.");
+    throw new Error("No wallet found. Install Coinbase/MetaMask.");
   }
+
+  // запросим аккаунт и сеть
   await window.ethereum.request({ method: "eth_requestAccounts" });
   try {
     await window.ethereum.request({
       method: "wallet_switchEthereumChain",
       params: [{ chainId: "0x14A34" }], // Base Sepolia (84532)
     });
-  } catch { /* ignore if already on chain */ }
+  } catch {}
 
   const wallet = createWalletClient({
     chain: baseSepolia,
     transport: custom(window.ethereum),
   });
 
-  return wrapFetchWithPayment(wallet, { method: "USDC" });
-}
-
-export async function payToUnlock(url: string) {
-  const paidFetch = await getPaidFetch();
+  const paidFetch = wrapFetchWithPayment(wallet, { method: "USDC" });
   const res = await paidFetch(url, { method: "GET" });
   if (!res.ok) throw new Error(`Unlock failed: ${res.status}`);
   return res.json();
