@@ -1,3 +1,4 @@
+// ...top of file (unchanged)
 import express from "express";
 import cors from "cors";
 import { paymentMiddleware } from "x402-express";
@@ -7,13 +8,31 @@ app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
-// === ENV ===
+// ENV
 const RECEIVER_ADDRESS = process.env.RECEIVER_ADDRESS || "";
 const FACILITATOR_URL  = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
 const X402_NETWORK     = process.env.X402_NETWORK || "base-sepolia";
 if (!RECEIVER_ADDRESS) throw new Error("RECEIVER_ADDRESS is not set");
 
-// === ПЕЙВОЛЛ ДОЛЖЕН ИДТИ ПЕРЕД РОУТАМИ ===
+// --- HARD GUARD: return 402 unless X-PAYMENT is present ---
+function requirePaid(req, res, next) {
+  if (!req.headers["x-payment"]) {
+    return res.status(402).json({
+      x402Version: 1,
+      error: "X-PAYMENT header is required",
+      accepts: [{
+        scheme: "exact",
+        network: X402_NETWORK,
+        resource: `${req.protocol}://${req.get("host")}/api/unlock`,
+        description: "Unlock premium post",
+        mimeType: "text/html",
+      }],
+    });
+  }
+  next();
+}
+
+// Paywall BEFORE routes (still keep it)
 app.use(paymentMiddleware(
   RECEIVER_ADDRESS,
   {
@@ -26,13 +45,13 @@ app.use(paymentMiddleware(
   { url: FACILITATOR_URL }
 ));
 
-// === КОНТЕНТ ПОСЛЕ ОПЛАТЫ ===
-app.get("/api/unlock", (req, res) => {
+// Content AFTER payment (guarded)
+app.get("/api/unlock", requirePaid, (req, res) => {
   const q = req.query ?? {};
   const esc = s => String(s || "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
   const title = esc((q.title ?? "Unlocked Post").toString().slice(0,200));
   const by    = esc((q.by    ?? "").toString().slice(0,120));
-  const img   = (q.img ? esc(q.img.toString()) : "");
+  const img   = (q.img ? esc(q.img.toString()).slice(0,2048) : "");
   const body  = esc((q.body  ?? "🎉 Payment confirmed.").toString().slice(0,8000)).replace(/\n/g,"<br>");
 
   res.type("html").send(`<!doctype html><meta charset="utf-8"><title>${title}</title>
@@ -43,7 +62,7 @@ app.get("/api/unlock", (req, res) => {
   <div class="card"><h1>${title}</h1>${by?`<div class="by">by ${by}</div>`:""}${img?`<img src="${img}" alt="">`:""}<div class="content">${body}</div></div>`);
 });
 
-// удобный редирект
+// convenience
 app.get("/", (_req, res) => res.redirect("/api/unlock?title=Demo&body=Pay%20%E2%86%92%20unlock"));
 
 const PORT = Number(process.env.PORT || process.env.X402_PORT || 4021);
