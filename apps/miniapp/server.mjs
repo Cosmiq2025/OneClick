@@ -147,6 +147,66 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Something went wrong" });
 });
 
+// Simple browser tester: builds /api/unlock URL and uses x402 to pay+render
+app.get("/preview", (req, res) => {
+  const FAC = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
+  const NET = process.env.X402_NETWORK || "base-sepolia";
+  const preset = {
+    title: (req.query.title || "Demo").toString(),
+    by:    (req.query.by    || "").toString(),
+    img:   (req.query.img   || "").toString(),
+    body:  (req.query.body  || "Hello world").toString(),
+  };
+  res.type("html").send(`<!doctype html>
+<meta charset="utf-8"><title>Preview & Unlock</title>
+<style>
+  body{font:16px/1.6 system-ui;margin:32px;max-width:860px}
+  input,textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:10px}
+  button{padding:10px 14px;border:0;border-radius:10px;background:#111;color:#fff;cursor:pointer}
+  .row{display:grid;gap:10px;margin:10px 0}
+  iframe{width:100%;height:70vh;border:1px solid #eee;border-radius:12px;margin-top:12px}
+  .muted{color:#666;font-size:13px}
+</style>
+<h1>Preview & Unlock</h1>
+<p class="muted">Network: ${NET}</p>
+<div class="row">
+  <label>Title <input id="t" value="${preset.title.replace(/"/g,'&quot;')}"></label>
+  <label>Author (optional) <input id="by" value="${preset.by.replace(/"/g,'&quot;')}"></label>
+  <label>Cover image URL (optional) <input id="img" value="${preset.img.replace(/"/g,'&quot;')}"></label>
+  <label>Body <textarea id="b" rows="6">${preset.body.replace(/</g,"&lt;")}</textarea></label>
+</div>
+<div class="row">
+  <button id="go">Preview & Unlock</button>
+  <span id="msg" class="muted"></span>
+</div>
+<iframe id="frame" sandbox="allow-same-origin"></iframe>
+<script type="module">
+  import { wrapFetchWithPayment } from "https://esm.sh/x402-fetch@0.1.0";
+  const FAC="${FAC}", NET="${NET}";
+  const payFetch = wrapFetchWithPayment(fetch, { facilitator: FAC, network: NET });
+  const $=id=>document.getElementById(id);
+  const t=$("t"), by=$("by"), img=$("img"), b=$("b"), msg=$("msg"), frame=$("frame");
+  function build(){
+    const p=new URLSearchParams();
+    if(t.value) p.set("title", t.value.slice(0,200));
+    if(by.value) p.set("by", by.value.slice(0,120));
+    if(img.value) p.set("img", img.value.slice(0,2048));
+    if(b.value) p.set("body", b.value.slice(0,8000));
+    return "/api/unlock?" + p.toString();
+  }
+  $("go").onclick = async () => {
+    msg.textContent = "Requesting…";
+    try {
+      const r = await payFetch(build(), { method:"GET", headers:[["accept","text/html"]] });
+      if (!r.ok) throw new Error(await r.text().catch(()=> "HTTP "+r.status));
+      frame.srcdoc = await r.text();
+      msg.textContent = "Unlocked ✅";
+    } catch(e){ msg.textContent = "Failed: " + (e?.message || e); }
+  };
+</script>`);
+});
+
+
 // 404 handler
 app.use((req, res) => {
   log("warn", "Route not found", { path: req.path, method: req.method });
