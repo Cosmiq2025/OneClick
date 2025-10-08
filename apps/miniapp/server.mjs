@@ -3,61 +3,38 @@ import cors from "cors";
 import { paymentMiddleware } from "x402-express";
 
 const app = express();
-
-// trust proxy so req.protocol becomes https behind Render/CF
 app.set("trust proxy", 1);
 
-// ---- CORS (allow your Lovable origin + X-PAYMENT header) ----
+// ---- CORS ----
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://one-click-warp.lovable.app";
 const corsOptions = {
   origin: CORS_ORIGIN,
-  methods: ["GET", "OPTIONS"],
+  methods: ["GET", "HEAD", "OPTIONS"],
   allowedHeaders: ["content-type", "accept", "x-payment"],
   credentials: false,
   maxAge: 86400,
 };
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-
 app.use(express.json());
 
 // ---- ENV ----
 const RECEIVER_ADDRESS = process.env.RECEIVER_ADDRESS || "";
-const FACILITATOR_URL = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
-const X402_NETWORK = process.env.X402_NETWORK || "base-sepolia";
+const FACILITATOR_URL  = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
+const X402_NETWORK     = process.env.X402_NETWORK || "base-sepolia";
 if (!RECEIVER_ADDRESS) throw new Error("RECEIVER_ADDRESS is not set");
 
-// ---- HTML ESCAPING (XSS Protection) ----
+// ---- XSS helpers ----
 const escapeHtml = (str) => {
-  const map = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  };
+  const map = { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" };
   return String(str).replace(/[&<>"']/g, (m) => map[m]);
 };
+const sanitizeInput = (v, max, d="") => (typeof v === "string" ? escapeHtml(v.trim().slice(0, max)) : d);
+const isValidUrl = (s) => { try { const u=new URL(String(s)); return u.protocol==="http:"||u.protocol==="https:"; } catch { return false; } };
 
-// ---- INPUT VALIDATION ----
-const sanitizeInput = (value, maxLength, defaultValue = "") => {
-  if (!value || typeof value !== "string") return defaultValue;
-  return escapeHtml(value.trim().slice(0, maxLength));
-};
-
-const isValidUrl = (str) => {
-  try {
-    const url = new URL(str);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
-};
-
-// ---- LOGGING ----
+// ---- logging ----
 const log = (level, message, meta = {}) => {
-  const timestamp = new Date().toISOString();
-  console.log(JSON.stringify({ timestamp, level, message, ...meta }));
+  console.log(JSON.stringify({ timestamp: new Date().toISOString(), level, message, ...meta }));
 };
 
 // ---- PAYWALL FIRST ----
@@ -73,44 +50,23 @@ app.use(paymentMiddleware(
   { url: FACILITATOR_URL }
 ));
 
-// ---- GUARD (belt & suspenders) ----
-const requirePaid = (req, res, next) => {
-  if (!req.headers["x-payment"]) {
-    log("warn", "Payment required", { path: req.path, ip: req.ip });
-    return res.status(402).json({
-      x402Version: 1,
-      error: "X-PAYMENT header is required",
-      accepts: [{
-        scheme: "exact",
-        network: X402_NETWORK,
-        resource: `${req.protocol}://${req.get("host")}${req.path}`,
-        description: "Unlock premium post",
-        mimeType: "text/html",
-      }],
-    });
-  }
-  next();
-};
-
 // ---- CONTENT AFTER PAYMENT ----
-app.get("/api/unlock", requirePaid, (req, res) => {
+app.get("/api/unlock", (req, res) => {
   try {
+    res.set("Cache-Control", "no-store"); // avoid caching unlocked HTML
     const q = req.query ?? {};
-    
-    // Sanitize and validate inputs
-    const title = sanitizeInput(q.title, 200, "Unlocked Post");
-    const by = sanitizeInput(q.by, 120);
+    const title  = sanitizeInput(q.title, 200, "Unlocked Post");
+    const by     = sanitizeInput(q.by,   120);
     const imgUrl = String(q.img || "").slice(0, 2048);
-    const img = imgUrl && isValidUrl(imgUrl) ? escapeHtml(imgUrl) : "";
-    const body = sanitizeInput(q.body, 8000, "🎉 Payment confirmed.");
-    
+    const img    = imgUrl && isValidUrl(imgUrl) ? escapeHtml(imgUrl) : "";
+    const body   = sanitizeInput(q.body, 8000, "🎉 Payment confirmed.");
+
     log("info", "Content unlocked", { title, hasImage: !!img });
 
     res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}</title>
 <style>
   body{font:16px/1.6 system-ui;margin:32px;background:#fafafa}
@@ -118,7 +74,7 @@ app.get("/api/unlock", requirePaid, (req, res) => {
   h1{font-size:28px;margin:0 0 6px;color:#222}
   img{max-width:100%;height:auto;border-radius:12px;margin:12px 0}
   .by{color:#666;font-size:13px;margin-bottom:16px}
-  .content{color:#333;line-height:1.8}
+  .content{color:#333;line-height:1.8;word-wrap:break-word;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -141,13 +97,7 @@ app.get("/", (_req, res) =>
   res.redirect("/api/unlock?title=Demo&body=Pay%20%E2%86%92%20unlock%20%E2%86%92%20post")
 );
 
-// ---- ERROR HANDLING ----
-app.use((err, req, res, next) => {
-  log("error", "Unhandled error", { error: err.message, stack: err.stack, path: req.path });
-  res.status(500).json({ error: "Something went wrong" });
-});
-
-// Simple browser tester: builds /api/unlock URL and uses x402 to pay+render
+// simple browser tester
 app.get("/preview", (req, res) => {
   const FAC = process.env.FACILITATOR_URL || "https://x402.org/facilitator";
   const NET = process.env.X402_NETWORK || "base-sepolia";
@@ -182,8 +132,10 @@ app.get("/preview", (req, res) => {
 <iframe id="frame" sandbox="allow-same-origin"></iframe>
 <script type="module">
   import { wrapFetchWithPayment } from "https://esm.sh/x402-fetch@0.1.0";
-  const FAC="${FAC}", NET="${NET}";
-  const payFetch = wrapFetchWithPayment(fetch, { facilitator: FAC, network: NET });
+  const payFetch = wrapFetchWithPayment(fetch, {
+    facilitator: "${FAC}",
+    network: "${NET}"
+  });
   const $=id=>document.getElementById(id);
   const t=$("t"), by=$("by"), img=$("img"), b=$("b"), msg=$("msg"), frame=$("frame");
   function build(){
@@ -206,18 +158,13 @@ app.get("/preview", (req, res) => {
 </script>`);
 });
 
-
-// 404 handler
+// 404 + error handlers
 app.use((req, res) => {
   log("warn", "Route not found", { path: req.path, method: req.method });
   res.status(404).json({ error: "Not found" });
 });
 
-// ---- LISTEN ----
 const PORT = Number(process.env.PORT || process.env.X402_PORT || 4021);
 app.listen(PORT, () => {
-  log("info", `Server started on port ${PORT}`, { 
-    network: X402_NETWORK, 
-    corsOrigin: CORS_ORIGIN 
-  });
+  log("info", `Server started on port ${PORT}`, { network: X402_NETWORK, corsOrigin: CORS_ORIGIN });
 });
