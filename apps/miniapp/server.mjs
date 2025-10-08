@@ -4,8 +4,21 @@ import { paymentMiddleware } from "x402-express";
 
 const app = express();
 
-// CORS: fine for share links (HTML response opens directly)
-app.use(cors());
+// trust proxy so req.protocol becomes https behind Render/CF
+app.set("trust proxy", 1);
+
+// ---- CORS (allow your Lovable origin + X-PAYMENT header) ----
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "https://one-click-warp.lovable.app";
+const corsOptions = {
+  origin: CORS_ORIGIN,
+  methods: ["GET", "OPTIONS"],
+  allowedHeaders: ["content-type", "accept", "x-payment"],
+  credentials: false,
+  maxAge: 86400,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
 app.use(express.json());
 
 // ---- ENV ----
@@ -14,21 +27,20 @@ const FACILITATOR_URL  = process.env.FACILITATOR_URL || "https://x402.org/facili
 const X402_NETWORK     = process.env.X402_NETWORK || "base-sepolia";
 if (!RECEIVER_ADDRESS) throw new Error("RECEIVER_ADDRESS is not set");
 
-// ---- PAYWALL FIRST (blocks GET /api/unlock until paid) ----
+// ---- PAYWALL FIRST ----
 app.use(paymentMiddleware(
   RECEIVER_ADDRESS,
   {
     "GET /api/unlock": {
       price: "$1.00",
       network: X402_NETWORK,
-      // HTML so the browser shows the post immediately after payment
       config: { description: "Unlock premium post", mimeType: "text/html" },
     },
   },
   { url: FACILITATOR_URL }
 ));
 
-// ---- GUARD: require X-PAYMENT header (enforce even if middleware misses) ----
+// ---- GUARD (belt & suspenders) ----
 const requirePaid = (req, res, next) => {
   if (!req.headers["x-payment"]) {
     return res.status(402).json({
@@ -46,7 +58,7 @@ const requirePaid = (req, res, next) => {
   next();
 };
 
-// ---- CONTENT AFTER SUCCESSFUL PAYMENT ----
+// ---- CONTENT AFTER PAYMENT ----
 app.get("/api/unlock", requirePaid, (req, res) => {
   const q = req.query ?? {};
   const title = String(q.title ?? "Unlocked Post").slice(0, 200);
@@ -70,11 +82,11 @@ app.get("/api/unlock", requirePaid, (req, res) => {
 </div>`);
 });
 
-// Optional: simple landing to test quickly
+// optional: sample landing
 app.get("/", (_req, res) =>
   res.redirect("/api/unlock?title=Demo&body=Pay%20%E2%86%92%20unlock%20%E2%86%92%20post")
 );
 
-// ---- LISTEN (Render/Heroku-style PORT) ----
+// ---- LISTEN ----
 const PORT = Number(process.env.PORT || process.env.X402_PORT || 4021);
 app.listen(PORT, () => console.log(`listening on :${PORT}`));
