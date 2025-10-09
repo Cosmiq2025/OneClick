@@ -32,7 +32,7 @@ function requirePaid(req, res, next) {
 
   const units = toUnits6(price);                   // USDC-6
   const minAmountRequired = String(units);         // exact price
-  const maxAmountRequired = String(Math.ceil(units * 1.20)); // +20% headroom
+  const maxAmountRequired = String(Math.ceil(units * 1.50)); // +50% headroom
 
   const fullUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
   return res.status(402).json({

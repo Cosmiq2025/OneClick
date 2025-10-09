@@ -1,38 +1,101 @@
-"use client";
+// app/components/UnlockButton.tsx (or your path)
+import React from "react";
+import { payToUnlock } from "x402-fetch";
+import { buildApiUrl } from "@/lib/utils"; // adjust import if your utils path differs
 
-import { useState } from "react";
-import { payToUnlock } from "../../lib/pay-client";
+type Props = {
+  priceUsd?: number;
+  title?: string;
+  body?: string;
+};
 
-export default function UnlockButton({ postId }: { postId: string }) {
-  const [loading, setLoading] = useState(false);
-  const [out, setOut] = useState<string>("");
+export default function UnlockButton({
+  priceUsd = 1,
+  title = "Test",
+  body = "Post",
+}: Props) {
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const [unlocked, setUnlocked] = React.useState<string | null>(null);
 
-  async function onClick() {
+  async function ensureWalletReady() {
+    const eth = (window as any).ethereum;
+    if (!eth) throw new Error("No EVM wallet found. Enable MetaMask or Coinbase Wallet for this site.");
+
+    // request accounts
+    await eth.request({ method: "eth_requestAccounts" });
+
+    // ensure Base Sepolia (0x14a34)
+    const cid: string = await eth.request({ method: "eth_chainId" });
+    if (cid !== "0x14a34") {
+      try {
+        await eth.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: "0x14a34" }],
+        });
+      } catch (e: any) {
+        // add chain if needed (code 4902)
+        if (e?.code === 4902) {
+          await eth.request({
+            method: "wallet_addEthereumChain",
+            params: [{
+              chainId: "0x14a34",
+              chainName: "Base Sepolia",
+              nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+              rpcUrls: ["https://sepolia.base.org"],
+              blockExplorerUrls: ["https://sepolia.basescan.org"],
+            }],
+          });
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
+
+  async function onUnlock() {
+    setError(null);
+    setUnlocked(null);
+    setLoading(true);
+
     try {
-      setLoading(true);
-      const base =
-        (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:4021").replace(/\/$/, "");
-      // add your own query params as your server expects (priceUsd/title/etc)
-      const url = `${base}/api/unlock?postId=${postId}&price=0.01&title=Demo`;
-      const data = await payToUnlock(url);
-      setOut(JSON.stringify(data, null, 2));
+      await ensureWalletReady();
+
+      const url = buildApiUrl("/api/unlock", { title, body, price: priceUsd });
+      console.log("[UnlockButton] API_BASE:", (window as any).__API_BASE__);
+      console.log("[UnlockButton] Calling URL:", url);
+
+      // IMPORTANT: no walletClient arg — x402-fetch will use window.ethereum internally
+      const result = await payToUnlock(url);
+
+      const content =
+        (result as any)?.content ??
+        (typeof result === "string" ? result : JSON.stringify(result, null, 2));
+
+      setUnlocked(content);
     } catch (e: any) {
-      alert(e.message || "Payment failed");
+      console.error("Unlock error:", e);
+      setError(e?.message ?? String(e));
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <div className="space-y-2">
+    <div className="w-full space-y-3">
       <button
-        onClick={onClick}
+        onClick={onUnlock}
         disabled={loading}
-        className="px-4 py-2 rounded bg-blue-600 text-white"
+        className="w-full h-11 rounded-md font-bold text-white"
+        style={{ background: "#1a1aff" }}
       >
-        {loading ? "Processing…" : "Unlock for $0.01 USDC"}
+        {loading ? "Processing…" : `Unlock for $${priceUsd.toFixed(2)} USDC`}
       </button>
-      {out && <pre className="text-xs p-2 bg-gray-50 rounded border overflow-auto">{out}</pre>}
+
+      {error && <div style={{ color: "#d00" }}>{error}</div>}
+      {unlocked && (
+        <pre style={{ whiteSpace: "pre-wrap", marginTop: 8 }}>{unlocked}</pre>
+      )}
     </div>
   );
 }
