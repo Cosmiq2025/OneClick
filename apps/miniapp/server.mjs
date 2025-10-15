@@ -75,6 +75,7 @@ class SplitCache {
 }
 const splitCache = new SplitCache();
 
+// ===== Helpers =====
 const clampUsd = (n) => (Number.isFinite(n) ? Math.min(100, Math.max(0.01, n)) : 1.0);
 const parseUsd = (q) => clampUsd(Number.parseFloat(Array.isArray(q) ? q[0] : q));
 const usdToUnits6 = (usd) => Math.round(usd * 1_000_000);
@@ -169,6 +170,30 @@ app.get("/api/unlock/:postId/payment-info", async (req, res, next) => {
   }
 });
 
+// ===== Optional hard 402 guard (ensures 402 if no X-PAYMENT) =====
+function hardRequirePaid({ postId, creator, price, splitAddress, req, res }) {
+  if (req.headers["x-payment"]) return null; // allow through to middleware
+  const units = usdToUnits6(price);
+  const fullUrl = `${req.protocol}://${req.get("host")}${req.baseUrl}${req.path}?creator=${creator}&price=${price}`;
+  return res.status(402).json({
+    x402Version: 1,
+    error: "Payment required",
+    accepts: [{
+      scheme: "exact",
+      network: X402_NETWORK,
+      resource: fullUrl,
+      description: `Unlock post: ${postId} ($${price.toFixed(2)})`,
+      mimeType: "application/json",
+      payTo: splitAddress,
+      asset: USDC_ADDRESS,
+      minAmountRequired: String(units),
+      maxAmountRequired: String(Math.ceil(units * 1.2)),
+      maxTimeoutSeconds: 60,
+      extra: { name: "USDC", decimals: 6 },
+    }],
+  });
+}
+
 // ===== Stateless unlock =====
 app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
   try {
@@ -192,10 +217,15 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
     const price = parseUsd(requestedPrice);
     const units = usdToUnits6(price);
 
+    // 1) HARD GUARD: send 402 if there is no X-PAYMENT yet
+    const maybeGuard = hardRequirePaid({ postId, creator, price, splitAddress, req, res });
+    if (maybeGuard) return; // 402 already sent
+
+    // 2) FACILITATOR PAYWALL: map must match Express route path (parametrized)
     const paywall = paymentMiddleware(
       splitAddress,
       {
-        [`GET /api/unlock/${postId}`]: {
+        "GET /api/unlock/:postId": {
           price: `$${price.toFixed(2)}`,
           network: X402_NETWORK,
           config: {
@@ -211,6 +241,7 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
       { url: FACILITATOR_URL }
     );
 
+    // Run the middleware; success only after payment validated
     paywall(req, res, (err) => {
       if (err) return next(err);
       res.json({
@@ -221,7 +252,6 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
         splitAddress,
         paid: `$${price.toFixed(2)}`,
         priceRequested: requestedPrice || "default",
-        content: "🎉 Hello from OneClick (demo)", // optional placeholder
       });
     });
   } catch (err) {
