@@ -3,7 +3,8 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { paymentMiddleware } from "x402-express";
-import { isAddress, getAddress } from "viem";
+import { isAddress, getAddress, createPublicClient, http } from "viem";
+import { base, baseSepolia } from "viem/chains";
 import { store as splits, initSplits, ensureCreatorSplit } from "./lib/splits.mjs";
 
 const app = express();
@@ -47,6 +48,13 @@ const USDC_ADDRESS =
 if (!isAddress(USDC_ADDRESS)) {
   throw new Error(`Invalid USDC_ADDRESS: ${USDC_ADDRESS}`);
 }
+
+// Setup chain and public client for transaction verification
+const CHAIN = X402_NETWORK === "base" ? base : baseSepolia;
+const publicClient = createPublicClient({
+  chain: CHAIN,
+  transport: http(process.env.RPC_BASE || (X402_NETWORK === "base" ? "https://mainnet.base.org" : "https://sepolia.base.org")),
+});
 
 /* ========= CORS / JSON ========= */
 
@@ -129,6 +137,76 @@ function getSplitWithCache(creator) {
 function getProto(req) {
   const xf = req.headers["x-forwarded-proto"];
   return (Array.isArray(xf) ? xf[0] : xf || req.protocol || "https").split(",")[0];
+}
+
+/* ========= Payment Verification ========= */
+
+// USDC Transfer event signature: Transfer(address indexed from, address indexed to, uint256 value)
+const TRANSFER_EVENT = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+/**
+ * Verify that a transaction sent USDC to the expected recipient with the correct amount
+ * @param {string} txHash - Transaction hash to verify
+ * @param {string} expectedRecipient - Expected recipient address (split contract)
+ * @param {string} minAmount - Minimum required amount in USDC units (e.g., "1000000" for $1)
+ * @param {string} usdcAddress - USDC contract address
+ * @returns {Promise<boolean>} - true if payment is valid
+ */
+async function verifyPaymentTransaction(txHash, expectedRecipient, minAmount, usdcAddress) {
+  try {
+    console.log(`[Verify] Checking transaction: ${txHash}`);
+    console.log(`[Verify] Expected recipient: ${expectedRecipient}`);
+    console.log(`[Verify] Min amount: ${minAmount} USDC units`);
+    
+    // Get transaction receipt
+    const receipt = await publicClient.getTransactionReceipt({ hash: txHash });
+    
+    if (receipt.status !== 'success') {
+      console.log(`[Verify] ✗ Transaction failed on chain (status: ${receipt.status})`);
+      return false;
+    }
+    
+    // Find USDC transfer event in the logs
+    const transferLog = receipt.logs.find(log => 
+      log.address.toLowerCase() === usdcAddress.toLowerCase() &&
+      log.topics[0] === TRANSFER_EVENT
+    );
+    
+    if (!transferLog) {
+      console.log(`[Verify] ✗ No USDC transfer found in transaction`);
+      return false;
+    }
+    
+    // Decode the transfer event
+    // topics[1] = from (indexed), topics[2] = to (indexed), data = amount
+    const recipient = '0x' + transferLog.topics[2].slice(-40).toLowerCase();
+    const amount = BigInt(transferLog.data);
+    
+    console.log(`[Verify] Found transfer: ${amount.toString()} units to ${recipient}`);
+    
+    // Verify recipient matches (case-insensitive)
+    if (recipient !== expectedRecipient.toLowerCase()) {
+      console.log(`[Verify] ✗ Recipient mismatch`);
+      console.log(`[Verify]   Expected: ${expectedRecipient.toLowerCase()}`);
+      console.log(`[Verify]   Got: ${recipient}`);
+      return false;
+    }
+    
+    // Verify amount is sufficient
+    const minAmountBigInt = BigInt(minAmount);
+    if (amount < minAmountBigInt) {
+      console.log(`[Verify] ✗ Amount too low`);
+      console.log(`[Verify]   Required: ${minAmountBigInt.toString()}`);
+      console.log(`[Verify]   Got: ${amount.toString()}`);
+      return false;
+    }
+    
+    console.log(`[Verify] ✓ Payment verified successfully!`);
+    return true;
+  } catch (err) {
+    console.error(`[Verify] Error checking transaction:`, err.message);
+    return false;
+  }
 }
 
 /* ========= Health ========= */
@@ -246,6 +324,7 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
   try {
     const { postId } = req.params;
     const creatorRaw = String(req.query.creator || "").trim();
+    const txHashFromQuery = String(req.query.txHash || "").trim();
 
     if (!creatorRaw || !isAddress(creatorRaw)) {
       return res.status(400).json({
@@ -272,6 +351,39 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
     const minReq = String(units);
     const maxReq = String(Math.ceil(units * 1.2));
 
+    // ========= MANUAL PAYMENT VERIFICATION =========
+    // Check if txHash is provided and verify it manually
+    if (txHashFromQuery && txHashFromQuery.startsWith('0x') && txHashFromQuery.length === 66) {
+      console.log(`[Unlock] Manual payment verification for tx: ${txHashFromQuery}`);
+      
+      const isValid = await verifyPaymentTransaction(
+        txHashFromQuery,
+        splitAddress,
+        minReq,
+        USDC_ADDRESS
+      );
+      
+      if (isValid) {
+        console.log(`[Unlock] ✓ Manual payment VERIFIED for postId=${postId}`);
+        return res.json({
+          ok: true,
+          unlocked: true,
+          postId,
+          creator,
+          splitAddress,
+          paid: `$${price.toFixed(2)}`,
+          txHash: txHashFromQuery,
+          verificationMethod: 'manual-blockchain',
+          priceRequested: requestedPrice || "default",
+        });
+      } else {
+        console.log(`[Unlock] ✗ Manual payment verification FAILED`);
+        // Don't return error, fall through to normal 402 flow
+        // This allows retry with correct payment
+      }
+    }
+
+    // ========= NORMAL X402 PAYWALL FLOW =========
     // Build both keys so the middleware matches regardless of literal vs pattern
     const method = req.method.toUpperCase(); // "GET"
     const literalKey = `${method} /api/unlock/${postId}`;
@@ -336,6 +448,7 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
         creator,
         splitAddress,
         paid: `$${price.toFixed(2)}`,
+        verificationMethod: 'x402-facilitator',
         priceRequested: requestedPrice || "default",
       });
     });
@@ -455,11 +568,14 @@ let server;
   Facilitator: ${FACILITATOR_URL}
   CORS:        ${ALLOW_ORIGINS.join(", ")}
   Splits:      ${splits.size?.() ?? 0} loaded
+  
+  ✓ Manual payment verification enabled
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Endpoints:
   POST /api/creators/onboard
   GET  /api/unlock/:postId?creator=0x...&price=1.00
+  GET  /api/unlock/:postId?creator=0x...&price=1.00&txHash=0x...  (manual verify)
   GET  /api/unlock/:postId/payment-info
   GET  /api/splits/:creator
   POST /api/splits
