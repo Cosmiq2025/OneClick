@@ -23,9 +23,12 @@
   },
   "dependencies": {
     "@0xsplits/splits-sdk": "^6.1.0",
+    "@aws-sdk/client-s3": "^3.913.0",
+    "@aws-sdk/s3-request-presigner": "^3.913.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "next": "15.5.4",
+    "pg": "https://registry.npmjs.org/pg/-/pg-8.11.3.tgz",
     "posthog-js": "^1.268.4",
     "react": "18.3.1",
     "react-dom": "18.3.1",

@@ -7,38 +7,72 @@ import { isAddress, getAddress, createPublicClient, http } from "viem";
 import { base, baseSepolia } from "viem/chains";
 import { store as splits, initSplits, ensureCreatorSplit } from "./lib/splits.mjs";
 
+// --- DB (Postgres) • ADDED ---
+import pg from "pg";
+const { Pool } = pg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
+});
+
+pool.on("connect", () => console.log("[DB] connected"));
+pool.on("error", (err) => console.error("[DB] idle client error:", err));
+
+async function getPost(postId) {
+  const q = await pool.query(
+    "select post_id, creator_address, title, body, content, blob_url, price_usd from posts where post_id=$1 limit 1",
+    [postId]
+  );
+  return q.rows[0] || null;
+}
+
+async function hasUnlocked(viewer, postId) {
+  const q = await pool.query(
+    "select 1 from unlocks where post_id=$1 and lower(viewer_wallet)=lower($2) limit 1",
+    [postId, viewer]
+  );
+  return q.rows.length > 0;
+}
+
+async function recordUnlock({ postId, viewer, txHash, amountUnits, network }) {
+  await pool.query(
+    `insert into unlocks (post_id, viewer_wallet, tx_hash, amount_units, network)
+     values ($1,$2,$3,$4,$5)
+     on conflict do nothing`,
+    [postId, String(viewer || "").toLowerCase(), txHash, Number(amountUnits || 0), network]
+  );
+}
+// --- end DB additions ---
+
 const app = express();
 app.set("trust proxy", 1);
 
 /* ========= ENV / Defaults ========= */
 
-// Normalize facilitator without forcing env changes.
-// If someone sets the dead "/facilitator" path, or non-www host, silently fix it.
 function normalizeFacilitator(raw) {
   let u = (raw || "https://www.x402.org").trim();
-  u = u.replace(/\/+$/, ""); // strip trailing slash(es)
+  u = u.replace(/\/+$/, "");
   if (/^https?:\/\/[^/]+\/facilitator$/i.test(u)) {
     console.warn(`[x402] FACILITATOR_URL points at /facilitator; using the host root instead`);
     u = u.replace(/\/facilitator$/i, "");
   }
-  // Prefer www to avoid a 308 hop from x402.org → www.x402.org
   u = u.replace("://x402.org", "://www.x402.org");
   return u;
 }
 
 const FACILITATOR_URL = normalizeFacilitator(process.env.FACILITATOR_URL);
-const X402_NETWORK = process.env.X402_NETWORK || "base-sepolia";
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+const X402_NETWORK    = process.env.X402_NETWORK || "base-sepolia";
+const ADMIN_TOKEN     = process.env.ADMIN_TOKEN || "";
 
-// USDC defaults by network
 const DEFAULT_USDC = {
-  base: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-  "base-sepolia": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+  base:          "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "base-sepolia":"0x036CbD53842c5426634e7929541eC2318f3dCF7e",
 };
 
 if (!DEFAULT_USDC[X402_NETWORK] && !process.env.USDC_ADDRESS) {
   throw new Error(
-    `Unsupported X402_NETWORK: ${X402_NETWORK}. Set USDC_ADDRESS explicitly or use one of: ${Object.keys(DEFAULT_USDC).join(", ")}`
+    `Unsupported X402_NETWORK: ${X402_NETWORK}. Set USDC_ADDRESS or use one of: ${Object.keys(DEFAULT_USDC).join(", ")}`
   );
 }
 
@@ -49,7 +83,6 @@ if (!isAddress(USDC_ADDRESS)) {
   throw new Error(`Invalid USDC_ADDRESS: ${USDC_ADDRESS}`);
 }
 
-// Setup chain and public client for transaction verification
 const CHAIN = X402_NETWORK === "base" ? base : baseSepolia;
 const publicClient = createPublicClient({
   chain: CHAIN,
@@ -68,7 +101,20 @@ if (ALLOW_ORIGINS.length === 0) {
   ALLOW_ORIGINS.push("http://localhost:3001");
 }
 
-app.use(cors({ origin: ALLOW_ORIGINS }));
+app.use(cors({
+  origin: ALLOW_ORIGINS,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "content-type",
+    "x-payment",
+    "x-payment-txhash",
+    "x-payment-proof",
+    "x-wallet-address",
+    "x-admin-token",
+  ],
+  maxAge: 86400,
+}));
+app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
 
 /* ========= Rate Limiting ========= */
@@ -118,7 +164,7 @@ function clampPriceUsd(n) {
   return Math.min(100.0, Math.max(0.01, n));
 }
 function parsePriceFromQuery(q) {
-  if (!q) return 1.0; // explicit default
+  if (!q) return 1.0;
   const n = Number.parseFloat(Array.isArray(q) ? q[0] : q);
   return clampPriceUsd(n);
 }
@@ -128,84 +174,61 @@ function usdToUnits6(usd) {
 function getSplitWithCache(creator) {
   let split = splitCache.get(creator);
   if (split) return split;
-  // SplitsStore API: get(creator) → string | undefined
   split = splits.get?.(creator);
   if (split) splitCache.set(creator, split);
   return split;
 }
-// respect proxies when building absolute URLs
 function getProto(req) {
   const xf = req.headers["x-forwarded-proto"];
   return (Array.isArray(xf) ? xf[0] : xf || req.protocol || "https").split(",")[0];
 }
 
-/* ========= Payment Verification ========= */
+/* ========= Payment Verification (viem) ========= */
 
-// USDC Transfer event signature: Transfer(address indexed from, address indexed to, uint256 value)
-const TRANSFER_EVENT = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const ERC20_TRANSFER_ABI = [{
+  type: "event",
+  name: "Transfer",
+  inputs: [
+    { indexed: true,  name: "from",  type: "address" },
+    { indexed: true,  name: "to",    type: "address" },
+    { indexed: false, name: "value", type: "uint256" },
+  ],
+}];
 
 /**
- * Verify that a transaction sent USDC to the expected recipient with the correct amount
- * @param {string} txHash - Transaction hash to verify
- * @param {string} expectedRecipient - Expected recipient address (split contract)
- * @param {string} minAmount - Minimum required amount in USDC units (e.g., "1000000" for $1)
- * @param {string} usdcAddress - USDC contract address
- * @returns {Promise<boolean>} - true if payment is valid
+ * Verify USDC Transfer(viewer -> payTo, value >= minUnits)
  */
-async function verifyPaymentTransaction(txHash, expectedRecipient, minAmount, usdcAddress) {
+async function verifyUsdcPayment({ txHash, viewer, payTo, minUnits }) {
   try {
-    console.log(`[Verify] Checking transaction: ${txHash}`);
-    console.log(`[Verify] Expected recipient: ${expectedRecipient}`);
-    console.log(`[Verify] Min amount: ${minAmount} USDC units`);
-    
-    // Get transaction receipt
-    const receipt = await publicClient.getTransactionReceipt({ hash: txHash });
-    
-    if (receipt.status !== 'success') {
-      console.log(`[Verify] ✗ Transaction failed on chain (status: ${receipt.status})`);
-      return false;
+    const receipt = await publicClient.getTransactionReceipt({ hash: txHash }).catch(() => null);
+    if (!receipt) return { ok: false, reason: "not_indexed_yet" };
+    if (receipt.status !== "success") return { ok: false, reason: "tx_reverted" };
+
+    const wantedToken = USDC_ADDRESS.toLowerCase();
+    const fromL = (viewer || "").toLowerCase();
+    const toL   = (payTo  || "").toLowerCase();
+
+    for (const log of receipt.logs) {
+      if ((log.address || "").toLowerCase() !== wantedToken) continue;
+      try {
+        const decoded = await publicClient.decodeEventLog({
+          abi: ERC20_TRANSFER_ABI,
+          data: log.data,
+          topics: log.topics,
+        });
+        if (decoded.eventName !== "Transfer") continue;
+        const from = String(decoded.args.from || "").toLowerCase();
+        const to   = String(decoded.args.to || "").toLowerCase();
+        const val  = BigInt(decoded.args.value.toString());
+        if (from === fromL && to === toL && val >= minUnits) {
+          return { ok: true };
+        }
+      } catch { /* ignore non-matching logs */ }
     }
-    
-    // Find USDC transfer event in the logs
-    const transferLog = receipt.logs.find(log => 
-      log.address.toLowerCase() === usdcAddress.toLowerCase() &&
-      log.topics[0] === TRANSFER_EVENT
-    );
-    
-    if (!transferLog) {
-      console.log(`[Verify] ✗ No USDC transfer found in transaction`);
-      return false;
-    }
-    
-    // Decode the transfer event
-    // topics[1] = from (indexed), topics[2] = to (indexed), data = amount
-    const recipient = '0x' + transferLog.topics[2].slice(-40).toLowerCase();
-    const amount = BigInt(transferLog.data);
-    
-    console.log(`[Verify] Found transfer: ${amount.toString()} units to ${recipient}`);
-    
-    // Verify recipient matches (case-insensitive)
-    if (recipient !== expectedRecipient.toLowerCase()) {
-      console.log(`[Verify] ✗ Recipient mismatch`);
-      console.log(`[Verify]   Expected: ${expectedRecipient.toLowerCase()}`);
-      console.log(`[Verify]   Got: ${recipient}`);
-      return false;
-    }
-    
-    // Verify amount is sufficient
-    const minAmountBigInt = BigInt(minAmount);
-    if (amount < minAmountBigInt) {
-      console.log(`[Verify] ✗ Amount too low`);
-      console.log(`[Verify]   Required: ${minAmountBigInt.toString()}`);
-      console.log(`[Verify]   Got: ${amount.toString()}`);
-      return false;
-    }
-    
-    console.log(`[Verify] ✓ Payment verified successfully!`);
-    return true;
-  } catch (err) {
-    console.error(`[Verify] Error checking transaction:`, err.message);
-    return false;
+    return { ok: false, reason: "transfer_not_found" };
+  } catch (e) {
+    console.error("[verifyUsdcPayment] error:", e?.message || e);
+    return { ok: false, reason: "verify_exception" };
   }
 }
 
@@ -237,21 +260,14 @@ app.post("/api/creators/onboard", onboardLimiter, async (req, res, next) => {
     const existing = splits.get?.(creator);
     if (existing) {
       console.log(`[Onboard] Creator ${creator} already exists → split ${existing}`);
-      return res.json({
-        ok: true,
-        splitAddress: existing,
-        record: { creator, split: existing },
-        alreadyExists: true,
-      });
+      return res.json({ ok: true, splitAddress: existing, record: { creator, split: existing }, alreadyExists: true });
     }
 
     console.log(`[Onboard] Creating split for ${creator}`);
     const splitAddress = await ensureCreatorSplit(creator);
     splitCache.set(creator, splitAddress);
 
-    // fetch back for consistency
     const record = splits.get?.(creator) ? { creator, split: splits.get(creator) } : { creator, split: splitAddress };
-
     console.log(`[Onboard] ✓ Creator ${creator} onboarded with split ${splitAddress}`);
     res.json({ ok: true, splitAddress, record, message: "Creator successfully onboarded" });
   } catch (e) {
@@ -266,24 +282,20 @@ app.get("/api/unlock/:postId/payment-info", async (req, res, next) => {
   try {
     const { postId } = req.params;
     const creatorRaw = String(req.query.creator || "").trim();
+    const viewer     = String(req.query.viewer  || "").trim();
 
     if (!creatorRaw || !isAddress(creatorRaw)) {
       return res.status(400).json({
         ok: false,
         error: "Missing or invalid ?creator=<wallet>",
-        example: `/api/unlock/${postId}/payment-info?creator=0x...&price=1.00`,
+        example: `/api/unlock/${postId}/payment-info?creator=0x...&price=1.00&viewer=0x...`,
       });
     }
 
     const creator = getAddress(creatorRaw);
     const splitAddress = getSplitWithCache(creator);
     if (!splitAddress) {
-      return res.status(400).json({
-        ok: false,
-        error: "Creator not onboarded",
-        creator,
-        hint: "POST /api/creators/onboard { wallet }",
-      });
+      return res.status(400).json({ ok: false, error: "Creator not onboarded", creator, hint: "POST /api/creators/onboard { wallet }" });
     }
 
     const price = parsePriceFromQuery(req.query.price);
@@ -291,26 +303,24 @@ app.get("/api/unlock/:postId/payment-info", async (req, res, next) => {
     const minReq = String(units);
     const maxReq = String(Math.ceil(units * 1.2));
 
-    const fullUrl = `${getProto(req)}://${req.get("host")}/api/unlock/${postId}?creator=${creator}&price=${price}`;
+    const fullUrl = `${getProto(req)}://${req.get("host")}/api/unlock/${postId}?creator=${creator}&price=${price}&viewer=${viewer}`;
 
     res.status(402).json({
       x402Version: 1,
       error: "Payment required",
-      accepts: [
-        {
-          scheme: "exact",
-          network: X402_NETWORK,
-          resource: fullUrl,
-          description: `Unlock post: ${postId} ($${price.toFixed(2)})`,
-          mimeType: "application/json",
-          payTo: splitAddress,
-          asset: USDC_ADDRESS,
-          minAmountRequired: minReq,
-          maxAmountRequired: maxReq,
-          maxTimeoutSeconds: 60,
-          extra: { name: "USDC", decimals: 6 },
-        },
-      ],
+      accepts: [{
+        scheme: "exact",
+        network: X402_NETWORK,
+        resource: fullUrl,
+        description: `Unlock post: ${postId} ($${price.toFixed(2)})`,
+        mimeType: "application/json",
+        payTo: splitAddress,
+        asset: USDC_ADDRESS,
+        minAmountRequired: minReq,
+        maxAmountRequired: String(Math.ceil(units * 1.2)),
+        maxTimeoutSeconds: 60,
+        extra: { name: "USDC", decimals: 6 },
+      }],
     });
   } catch (err) {
     console.error("[Payment-Info] Error:", err);
@@ -324,25 +334,23 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
   try {
     const { postId } = req.params;
     const creatorRaw = String(req.query.creator || "").trim();
-    const txHashFromQuery = String(req.query.txHash || "").trim();
+    const viewer     = String(req.query.viewer  || "").trim();
+    const txHashQ    = String(req.query.txHash || "").trim();
+    const txHashH    = String(req.header("x-payment-txhash") || "").trim();
+    const txHash     = (txHashQ || txHashH);
 
     if (!creatorRaw || !isAddress(creatorRaw)) {
       return res.status(400).json({
         ok: false,
         error: "Missing or invalid ?creator=<wallet>",
-        example: `/api/unlock/${postId}?creator=0x...&price=1.00`,
+        example: `/api/unlock/${postId}?creator=0x...&price=1.00&viewer=0x...`,
       });
     }
 
     const creator = getAddress(creatorRaw);
     const splitAddress = getSplitWithCache(creator);
     if (!splitAddress) {
-      return res.status(400).json({
-        ok: false,
-        error: "Creator must onboard first",
-        message: "POST /api/creators/onboard { wallet }",
-        creator,
-      });
+      return res.status(400).json({ ok: false, error: "Creator must onboard first", message: "POST /api/creators/onboard { wallet }", creator });
     }
 
     const requestedPrice = req.query.price;
@@ -351,41 +359,70 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
     const minReq = String(units);
     const maxReq = String(Math.ceil(units * 1.2));
 
-    // ========= MANUAL PAYMENT VERIFICATION =========
-    // Check if txHash is provided and verify it manually
-    if (txHashFromQuery && txHashFromQuery.startsWith('0x') && txHashFromQuery.length === 66) {
-      console.log(`[Unlock] Manual payment verification for tx: ${txHashFromQuery}`);
-      
-      const isValid = await verifyPaymentTransaction(
-        txHashFromQuery,
-        splitAddress,
-        minReq,
-        USDC_ADDRESS
-      );
-      
-      if (isValid) {
-        console.log(`[Unlock] ✓ Manual payment VERIFIED for postId=${postId}`);
+    // ======== DB FAST-PATH (already unlocked) • ADDED ========
+    if (viewer && await hasUnlocked(viewer, postId)) {
+      const post = await getPost(postId);
+      if (!post) return res.status(404).json({ ok: false, error: "post_not_found" });
+      const content = post.content ?? post.body ?? null;
+      return res.json({
+        ok: true,
+        unlocked: true,
+        cached: true,
+        postId,
+        title: post.title,
+        body: content,
+        creator: post.creator_address,
+        message: "Already unlocked",
+      });
+    }
+    // ======== end fast-path ========
+
+    // ========= MANUAL PAYMENT VERIFICATION (txHash) =========
+    if (txHash && txHash.startsWith("0x") && txHash.length === 66) {
+      console.log(`[Unlock] Manual verify for tx=${txHash}, postId=${postId}`);
+      const { ok, reason } = await verifyUsdcPayment({
+        txHash,
+        viewer,
+        payTo: splitAddress,
+        minUnits: BigInt(minReq),
+      });
+
+      if (ok) {
+        console.log(`[Unlock] ✓ VERIFIED: viewer=${viewer} → split=${splitAddress} ≥ ${minReq}`);
+
+        // ======== persist unlock • ADDED ========
+        try {
+          await recordUnlock({
+            postId,
+            viewer,
+            txHash,
+            amountUnits: Number(minReq), // store the requested min (or parse actual amount if desired)
+            network: X402_NETWORK || "base-sepolia",
+          });
+        } catch (e) {
+          console.warn("[Unlock] recordUnlock failed (non-fatal):", e?.message || e);
+        }
+        // ======== end persist ========
+
         return res.json({
           ok: true,
           unlocked: true,
           postId,
           creator,
+          viewer,
           splitAddress,
           paid: `$${price.toFixed(2)}`,
-          txHash: txHashFromQuery,
-          verificationMethod: 'manual-blockchain',
+          txHash,
+          verificationMethod: "manual-blockchain",
           priceRequested: requestedPrice || "default",
         });
-      } else {
-        console.log(`[Unlock] ✗ Manual payment verification FAILED`);
-        // Don't return error, fall through to normal 402 flow
-        // This allows retry with correct payment
       }
+      // not verified yet → fall through to 402 so client can retry
+      console.log(`[Unlock] not verified yet (reason=${reason})`);
     }
 
-    // ========= NORMAL X402 PAYWALL FLOW =========
-    // Build both keys so the middleware matches regardless of literal vs pattern
-    const method = req.method.toUpperCase(); // "GET"
+    // ========= NORMAL X402 PAYWALL (facilitator) =========
+    const method     = req.method.toUpperCase(); // "GET"
     const literalKey = `${method} /api/unlock/${postId}`;
     const patternKey = `${method} /api/unlock/:postId`;
 
@@ -408,47 +445,42 @@ app.get("/api/unlock/:postId", unlockLimiter, async (req, res, next) => {
       { url: FACILITATOR_URL }
     );
 
-    // Apply paywall
     paywall(req, res, (err) => {
       if (err) return next(err);
 
-      // ---- SAFETY NET ----
-      // If the middleware didn't 402 and didn't mark it paid, return 402 ourselves
+      // SAFETY NET 402 (include viewer!)
       if (!res.headersSent && !(req.x402 && req.x402.paid === true)) {
-        const fullUrl = `${getProto(req)}://${req.get("host")}/api/unlock/${postId}?creator=${creator}&price=${price}`;
+        const fullUrl = `${getProto(req)}://${req.get("host")}/api/unlock/${postId}?creator=${creator}&price=${price}&viewer=${viewer}`;
         return res.status(402).json({
           x402Version: 1,
           error: "Payment required",
-          accepts: [
-            {
-              scheme: "exact",
-              network: X402_NETWORK,
-              resource: fullUrl,
-              description: `Unlock post: ${postId} ($${price.toFixed(2)})`,
-              mimeType: "application/json",
-              payTo: splitAddress,
-              asset: USDC_ADDRESS,
-              minAmountRequired: minReq,
-              maxAmountRequired: maxReq,
-              maxTimeoutSeconds: 60,
-              extra: { name: "USDC", decimals: 6 },
-            },
-          ],
+          accepts: [{
+            scheme: "exact",
+            network: X402_NETWORK,
+            resource: fullUrl,
+            description: `Unlock post: ${postId} ($${price.toFixed(2)})`,
+            mimeType: "application/json",
+            payTo: splitAddress,
+            asset: USDC_ADDRESS,
+            minAmountRequired: minReq,
+            maxAmountRequired: maxReq,
+            maxTimeoutSeconds: 60,
+            extra: { name: "USDC", decimals: 6 },
+          }],
         });
       }
 
-      // Paid → success
-      console.log(
-        `[Unlock] ✓ postId=${postId} creator=${creator} split=${splitAddress} price=$${price.toFixed(2)}`
-      );
+      // Paid via facilitator → success
+      console.log(`[Unlock] ✓ facilitator paid postId=${postId} creator=${creator} split=${splitAddress} price=$${price.toFixed(2)}`);
       res.json({
         ok: true,
         unlocked: true,
         postId,
         creator,
+        viewer,
         splitAddress,
         paid: `$${price.toFixed(2)}`,
-        verificationMethod: 'x402-facilitator',
+        verificationMethod: "x402-facilitator",
         priceRequested: requestedPrice || "default",
       });
     });
@@ -469,11 +501,7 @@ app.get("/api/splits/:creator", (req, res) => {
     const normalized = getAddress(creator);
     const split = splits.get ? splits.get(normalized) : undefined;
     if (!split) {
-      return res.status(404).json({
-        ok: false,
-        error: "Split not found for this creator",
-        creator: normalized,
-      });
+      return res.status(404).json({ ok: false, error: "Split not found for this creator", creator: normalized });
     }
     res.json({ ok: true, record: { creator: normalized, split } });
   } catch (err) {
@@ -492,13 +520,12 @@ app.post("/api/splits", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid address format" });
     }
     const normalizedCreator = getAddress(creator);
-    const normalizedSplit = getAddress(split);
+    const normalizedSplit   = getAddress(split);
 
-    // SplitsStore exposes upsert({ creator, split })
     const record = await splits.upsert({ creator: normalizedCreator, split: normalizedSplit });
     splitCache.set(normalizedCreator, normalizedSplit);
 
-    console.log(`[Splits POST] Manually added split for ${normalizedCreator}: ${normalizedSplit}`);
+    console.log(`[Splits POST] Added split for ${normalizedCreator}: ${normalizedSplit}`);
     res.json({ ok: true, record });
   } catch (e) {
     console.error("[Splits POST] Error:", e);
@@ -506,7 +533,7 @@ app.post("/api/splits", async (req, res) => {
   }
 });
 
-/* ========= Admin auth (strict) ========= */
+/* ========= Admin auth & endpoints ========= */
 
 function adminOnly(req, res, next) {
   const token = req.get("x-admin-token");
@@ -515,8 +542,6 @@ function adminOnly(req, res, next) {
   }
   next();
 }
-
-/* ========= Admin endpoints ========= */
 
 app.post("/api/admin/cache/clear", adminOnly, (_req, res) => {
   splitCache.clear();
@@ -548,7 +573,7 @@ app.use((err, _req, res, _next) => {
   res.status(err.status || 500).json({ ok: false, error: err.message || "Internal server error" });
 });
 
-/* ========= Startup & graceful shutdown ========= */
+/* ========= Startup ========= */
 
 const PORT = Number(process.env.PORT || process.env.X402_PORT || 4021);
 let server;
@@ -557,7 +582,6 @@ let server;
   try {
     await initSplits();
     console.log(`[Store] Initialized with ${splits.size?.() ?? 0} cached splits`);
-
     server = app.listen(PORT, () => {
       console.log(`
 🚀 x402 Micropayment Server
@@ -568,14 +592,15 @@ let server;
   Facilitator: ${FACILITATOR_URL}
   CORS:        ${ALLOW_ORIGINS.join(", ")}
   Splits:      ${splits.size?.() ?? 0} loaded
-  
-  ✓ Manual payment verification enabled
+
+  ✓ Manual payment verification enabled (txHash)
+  ✓ Facilitator fallback (x402-express)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Endpoints:
   POST /api/creators/onboard
-  GET  /api/unlock/:postId?creator=0x...&price=1.00
-  GET  /api/unlock/:postId?creator=0x...&price=1.00&txHash=0x...  (manual verify)
+  GET  /api/unlock/:postId?creator=0x...&price=1.00&viewer=0x...
+  GET  /api/unlock/:postId?creator=0x...&price=1.00&viewer=0x...&txHash=0x...  (manual verify)
   GET  /api/unlock/:postId/payment-info
   GET  /api/splits/:creator
   POST /api/splits
