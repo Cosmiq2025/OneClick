@@ -771,27 +771,3 @@ function shutdown(signal) {
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-
-  // Close database pool first (if exists)
-  if (pool) {
-    pool.end(() => {
-      console.log("[Shutdown] Database pool closed");
-      closeServer();
-    });
-  } else {
-    closeServer();
-  }
-  
-  function closeServer() {
-    if (server) {
-      server.close(() => {
-        console.log("[Shutdown] HTTP server closed");
-        process.exit(0);
-      });
-
-      // Force exit after 10 seconds
-      setTimeout(() => {
-        console.warn("[Shutdown] Force exit after 10s");
-        process.exit(0);
-      }, 10_000).unref();
