@@ -739,9 +739,6 @@ Admin (Header: x-admin-token):
 })();
 
 /* ========= Graceful Shutdown ========= */
-
-/* ========= Graceful Shutdown ========= */
-
 function shutdown(signal) {
   console.log(`[Shutdown] Received ${signal}, closing connections...`);
 
